@@ -730,18 +730,9 @@ namespace Frida {
 		private Cancellable cancellable = new Cancellable ();
 		private Gee.HashMap<uint, CrashDelivery> crash_deliveries = new Gee.HashMap<uint, CrashDelivery> ();
 		private Gee.HashMap<uint, CrashBuilder> crash_builders = new Gee.HashMap<uint, CrashBuilder> ();
-		private Regex java_crash_pattern;
-		private Regex native_crash_pattern;
 		private Timer since_start;
 
 		construct {
-			try {
-				java_crash_pattern = new Regex ("^Process: (.+), PID: (\\d+)$", MULTILINE);
-				native_crash_pattern = new Regex ("^pid: (\\d+), tid: \\d+, name: (.+) +>>>", MULTILINE);
-			} catch (RegexError e) {
-				assert_not_reached ();
-			}
-
 			start_monitoring ();
 
 			since_start = new Timer ();
@@ -787,22 +778,17 @@ namespace Frida {
 
 			bool is_java_crash = entry.message.has_prefix ("FATAL EXCEPTION: ");
 			if (is_java_crash) {
-				string report = entry.message;
-
-				MatchInfo mi;
-				if (java_crash_pattern.match (report, 0, out mi)) {
-					string process_name = mi.fetch (1);
-
-					string raw_pid = mi.fetch (2);
-					uint pid = (uint) uint64.parse (raw_pid);
-
-					on_crash_received (CrashInfo (pid, process_name, report));
+				try {
+					var crash = parse_java_report (entry.message);
+					on_crash_received (crash);
+				} catch (Error e) {
+					printerr ("parse_java_report() failed: %s\n%s\n", e.message, entry.message);
 				}
 
 				return;
 			}
 
-			var builder = get_crash_builder_for_pid (entry.pid);
+			var builder = get_crash_builder_for_reporter_pid (entry.pid);
 			builder.append (entry.message);
 		}
 
@@ -820,7 +806,7 @@ namespace Frida {
 			crash_deliveries.unset (delivery.pid);
 		}
 
-		private CrashBuilder get_crash_builder_for_pid (uint pid) {
+		private CrashBuilder get_crash_builder_for_reporter_pid (uint pid) {
 			var builder = crash_builders[pid];
 			if (builder == null) {
 				builder = new CrashBuilder (pid);
@@ -831,17 +817,72 @@ namespace Frida {
 		}
 
 		private void on_crash_builder_completed (CrashBuilder builder, string report) {
-			crash_builders.unset (builder.pid);
+			crash_builders.unset (builder.reporter_pid);
 
-			MatchInfo mi;
-			if (native_crash_pattern.match (report, 0, out mi)) {
-				string raw_pid = mi.fetch (1);
-				uint pid = (uint) uint64.parse (raw_pid);
-
-				string process_name = mi.fetch (2);
-
-				on_crash_received (CrashInfo (pid, process_name, report));
+			try {
+				var crash = parse_native_report (report);
+				on_crash_received (crash);
+			} catch (Error e) {
+				printerr ("parse_native_report() failed: %s\n%s\n", e.message, report);
 			}
+		}
+
+		private static CrashInfo parse_java_report (string report) throws Error {
+			MatchInfo info;
+			if (!/^Process: (.+), PID: (\d+)$/m.match (report, 0, out info)) {
+				throw new Error.INVALID_ARGUMENT ("Malformed Java crash report");
+			}
+
+			string process_name = info.fetch (1);
+
+			string raw_pid = info.fetch (2);
+			uint pid = (uint) uint64.parse (raw_pid);
+
+			string summary = summarize_java_report (report);
+
+			return CrashInfo (pid, process_name, summary, report);
+		}
+
+		private static CrashInfo parse_native_report (string report) throws Error {
+			MatchInfo info;
+			if (!/^pid: (\d+), tid: \d+, name: (.+) +>>>/m.match (report, 0, out info)) {
+				throw new Error.INVALID_ARGUMENT ("Malformed native crash report");
+			}
+
+			string raw_pid = info.fetch (1);
+			uint pid = (uint) uint64.parse (raw_pid);
+
+			string process_name = info.fetch (2);
+
+			string summary = summarize_native_report (report);
+
+			return CrashInfo (pid, process_name, summary, report);
+		}
+
+		private static string summarize_java_report (string report) throws Error {
+			MatchInfo info;
+
+			string? last_cause = null;
+			try {
+				var cause_pattern = /^Caused by: (.+)$/m;
+				cause_pattern.match (report, 0, out info);
+				while (info.matches ()) {
+					last_cause = info.fetch (1);
+					info.next ();
+				}
+			} catch (RegexError e) {
+			}
+			if (last_cause != null)
+				return last_cause;
+
+			var lines = report.split ("\n", 4);
+			if (lines.length < 3)
+				throw new Error.INVALID_ARGUMENT ("Malformed Java crash report");
+			return lines[2];
+		}
+
+		private static string summarize_native_report (string report) throws Error {
+			return "FIXME";
 		}
 
 		private void start_monitoring () {
@@ -978,41 +1019,68 @@ namespace Frida {
 		private class CrashBuilder : Object {
 			public signal void completed (string report);
 
-			public uint pid {
+			public uint reporter_pid {
 				get;
 				construct;
 			}
 
 			private StringBuilder report = new StringBuilder ();
-			private TimeoutSource expiry_source;
+			private TimeoutSource completion_source = null;
 
-			public CrashBuilder (uint pid) {
-				Object (pid: pid);
+			public CrashBuilder (uint reporter_pid) {
+				Object (reporter_pid: reporter_pid);
 			}
 
 			construct {
-				expiry_source = make_expiry_source (250);
+				start_polling_reporter_pid ();
 			}
 
 			public void append (string chunk) {
 				report.append (chunk);
-				reset_timeout ();
+
+				defer_completion ();
 			}
 
-			private TimeoutSource make_expiry_source (uint timeout) {
-				var source = new TimeoutSource (timeout);
-				source.set_callback (on_timeout);
+			private void start_polling_reporter_pid () {
+				var source = new TimeoutSource (50);
+				source.set_callback (on_poll_tick);
 				source.attach (MainContext.get_thread_default ());
-				return source;
 			}
 
-			private void reset_timeout () {
-				expiry_source.destroy ();
-				expiry_source = make_expiry_source (250);
+			private bool on_poll_tick () {
+				bool reporter_still_alive = Posix.kill ((Posix.pid_t) reporter_pid, 0) == 0;
+				log_event ("[reporter_pid %u] reporter_still_alive=%s", reporter_pid, reporter_still_alive.to_string ());
+				if (!reporter_still_alive)
+					schedule_completion ();
+
+				return reporter_still_alive;
 			}
 
-			private bool on_timeout () {
+			private void schedule_completion () {
+				log_event ("[reporter_pid %u] scheduling completion", reporter_pid);
+				completion_source = new TimeoutSource (250);
+				completion_source.set_callback (on_complete);
+				completion_source.attach (MainContext.get_thread_default ());
+			}
+
+			private void defer_completion () {
+				if (completion_source == null)
+					return;
+
+				log_event ("[reporter_pid %u] deferring completion", reporter_pid);
+
+				completion_source.destroy ();
+				completion_source = null;
+
+				schedule_completion ();
+			}
+
+			private bool on_complete () {
+				log_event ("[reporter_pid %u] complete", reporter_pid);
+
 				completed (report.str);
+
+				completion_source = null;
 
 				return false;
 			}
